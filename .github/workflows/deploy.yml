@@ -1,0 +1,83 @@
+name: Deploy to VPS
+
+on:
+    push:
+        branches:
+            - main
+
+jobs:
+    deploy:
+        runs-on: ubuntu-latest
+
+        steps:
+            - name: Checkout code
+              uses: actions/checkout@v3
+
+            - name: Install Node.js
+              uses: actions/setup-node@v3
+              with:
+                  node-version: 20
+
+            - name: Install dependencies
+              run: npm install
+
+            - name: Create environment file
+              run: |
+                  echo "BETTER_AUTH_SECRET=${{ secrets.BETTER_AUTH_SECRET }}" >> .env
+                  echo "BETTER_AUTH_URL=${{ secrets.BETTER_AUTH_URL }}" >> .env
+                  echo "TURSO_DATABASE_URL=${{ secrets.TURSO_DATABASE_URL }}" >> .env
+                  echo "TURSO_AUTH_TOKEN=${{ secrets.TURSO_AUTH_TOKEN }}" >> .env
+                  echo "GH_CLIENT_ID=${{ secrets.GH_CLIENT_ID }}" >> .env
+                  echo "GH_CLIENT_SECRET=${{ secrets.GH_CLIENT_SECRET }}" >> .env
+                  echo "NEXT_PUBLIC_APP_URL=${{ secrets.NEXT_PUBLIC_APP_URL }}" >> .env
+
+            - name: Build the application
+              run: npm run build
+
+            - name: Deploy to VPS
+              env:
+                SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+                SSH_HOST: ${{ secrets.SSH_HOST }}
+                SSH_USER: ${{ secrets.SSH_USER }}
+                SSH_PORT: ${{ secrets.SSH_PORT }}
+              run: |
+                # SSH-Schlüssel einrichten
+                mkdir -p ~/.ssh
+                echo "$SSH_PRIVATE_KEY" > ~/.ssh/id_rsa
+                chmod 600 ~/.ssh/id_rsa
+
+                # SSH-Verbindung testen
+                ssh -o StrictHostKeyChecking=no -p $SSH_PORT $SSH_USER@$SSH_HOST "echo 'SSH connection successful'"
+
+                # Dateien übertragen
+                rsync -avz --delete -e "ssh -p $SSH_PORT" --exclude="node_modules" --exclude=".git" --exclude=".github" ./ $SSH_USER@$SSH_HOST:/home/Web/kurz
+
+                # Abhängigkeiten installieren und PM2 neu starten
+                ssh -p $SSH_PORT $SSH_USER@$SSH_HOST << 'EOF'
+                # Installieren von nvm, falls nicht vorhanden
+                if [ ! -d "$HOME/.nvm" ]; then
+                    echo "NVM is not installed. Installing NVM..."
+                    curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.5/install.sh | bash
+                fi
+
+                # Laden von NVM
+                export NVM_DIR="$HOME/.nvm"
+                [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
+
+                # Prüfen der aktuellen Node.js-Version
+                CURRENT_NODE_VERSION=$(node -v | sed 's/v//')
+                echo "Current Node.js version: $CURRENT_NODE_VERSION"
+
+                # Wechsel zu Node.js 22, falls notwendig
+                if [ "$CURRENT_NODE_VERSION" != "22" ]; then
+                    echo "Switching to Node.js 22..."
+                    nvm install 22
+                    nvm use 22
+                fi
+
+                cd /home/Web/kurz
+                npm install --production
+                pm2 delete kurz || true
+                pm2 start npm --name "kurz" -- start
+                pm2 save
+                EOF
