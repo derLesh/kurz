@@ -11,15 +11,16 @@ jobs:
 
         steps:
             - name: Checkout code
-              uses: actions/checkout@v3
+              uses: actions/checkout@v4
 
             - name: Install Node.js
-              uses: actions/setup-node@v3
+              uses: actions/setup-node@v4
               with:
-                  node-version: 20
+                  node-version: 22
+                  cache: 'npm'
 
             - name: Install dependencies
-              run: npm install
+              run: npm ci
 
             - name: Create environment file
               run: |
@@ -41,43 +42,112 @@ jobs:
                 SSH_USER: ${{ secrets.SSH_USER }}
                 SSH_PORT: ${{ secrets.SSH_PORT }}
               run: |
-                # SSH-Schlüssel einrichten
+                # SSH-Verzeichnis und Schlüssel sicher einrichten
                 mkdir -p ~/.ssh
                 echo "$SSH_PRIVATE_KEY" > ~/.ssh/id_rsa
                 chmod 600 ~/.ssh/id_rsa
+                echo "Host deployment-target
+                  HostName $SSH_HOST
+                  User ${{ secrets.SSH_USER }}
+                  Port $SSH_PORT
+                  StrictHostKeyChecking no
+                  IdentityFile ~/.ssh/id_rsa" > ~/.ssh/config                
 
-                # SSH-Verbindung testen
-                ssh -o StrictHostKeyChecking=no -p $SSH_PORT $SSH_USER@$SSH_HOST "echo 'SSH connection successful'"
+            - name: Test SSH connection
+              run: ssh deployment-target "echo 'SSH connection successful'"
+    
+            - name: Deploy to VPS with rsync
+              run: |
+                rsync -avz --delete \
+                  --exclude="node_modules" \
+                  --exclude=".git" \
+                  --exclude=".github" \
+                  --exclude=".env*" \
+                  ./ deployment-target:/home/Apps/Webapps/Kurz/
 
-                # Dateien übertragen
-                rsync -avz --delete -e "ssh -p $SSH_PORT" --exclude="node_modules" --exclude=".git" --exclude=".github" ./ $SSH_USER@$SSH_HOST:/home/Web/kurz
-
-                # Abhängigkeiten installieren und PM2 neu starten
-                ssh -p $SSH_PORT $SSH_USER@$SSH_HOST << 'EOF'
-                # Installieren von nvm, falls nicht vorhanden
-                if [ ! -d "$HOME/.nvm" ]; then
-                    echo "NVM is not installed. Installing NVM..."
-                    curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.5/install.sh | bash
+            - name: Detect Node.js and PM2 paths
+              id: detect_paths
+              run: |
+                echo "Suche nach Node.js und PM2 auf dem Server..."
+                
+                # npm-Pfad ermitteln
+                NPM_PATH=$(ssh deployment-target "find ~/.nvm -path \"*/bin/npm\" | head -n 1")
+                if [ -z "$NPM_PATH" ]; then
+                  echo "WARNUNG: Konnte npm nicht finden"
+                  NPM_PATH="npm"  # Fallback
+                fi
+                echo "npm_path=$NPM_PATH" >> $GITHUB_OUTPUT
+                
+                # PM2-Pfad ermitteln
+                PM2_PATH=$(ssh deployment-target "find ~/.nvm -path \"*/bin/pm2\" | head -n 1")
+                if [ -z "$PM2_PATH" ]; then
+                  echo "PM2 nicht gefunden, versuche Installation..."
+                  ssh deployment-target "export NVM_DIR=\"\$HOME/.nvm\" && . \"\$NVM_DIR/nvm.sh\" && npm install -g pm2"
+                  PM2_PATH=$(ssh deployment-target "find ~/.nvm -path \"*/bin/pm2\" | head -n 1")
+                  
+                  if [ -z "$PM2_PATH" ]; then
+                    echo "WARNUNG: PM2 konnte nicht gefunden oder installiert werden"
+                    PM2_PATH="pm2"  # Fallback
+                  fi
                 fi
 
-                # Laden von NVM
-                export NVM_DIR="$HOME/.nvm"
-                [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
-
-                # Prüfen der aktuellen Node.js-Version
-                CURRENT_NODE_VERSION=$(node -v | sed 's/v//')
-                echo "Current Node.js version: $CURRENT_NODE_VERSION"
-
-                # Wechsel zu Node.js 22, falls notwendig
-                if [ "$CURRENT_NODE_VERSION" != "22" ]; then
-                    echo "Switching to Node.js 22..."
-                    nvm install 22
-                    nvm use 22
-                fi
-
-                cd /home/Web/kurz
-                npm install --production
-                pm2 delete kurz || true
-                pm2 start npm --name "kurz" -- start
-                pm2 save
+            - name: Setup application on server
+              run: |
+                ssh deployment-target << 'EOF'
+                  # NVM-Umgebung richtig initialisieren
+                  export NVM_DIR="$HOME/.nvm"
+                  [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
+                  
+                  # Wichtig: Node.js Version explizit aktivieren
+                  nvm use 22 || nvm use 18 || nvm use --lts || nvm use default
+                  
+                  # Sicherstellen dass Node.js im Pfad ist
+                  NODE_PATH=$(which node)
+                  if [ -z "$NODE_PATH" ]; then
+                    echo "FEHLER: Node.js konnte nicht gefunden werden"
+                    exit 1
+                  fi
+                  echo "Node.js gefunden: $NODE_PATH"
+                  
+                  # Zur Applikation wechseln
+                  cd /home/Apps/Webapps/Kurz
+                  
+                  # Abhängigkeiten installieren
+                  npm ci --production
+                  
+                  # Prüfen, ob der Prozess existiert und entsprechend handeln
+                  if pm2 list | grep -q "Kurz"; then
+                    echo "Prozess existiert - wird neugestartet"
+                    pm2 reload Kurz || pm2 restart Kurz
+                  else
+                    echo "Prozess existiert nicht - wird neu erstellt"
+                    pm2 start npm --name "Kurz" -- start
+                  fi
+                  
+                  pm2 save
                 EOF
+
+            - name: Verify deployment
+              run: |
+                ssh deployment-target << 'EOF'
+                  # NVM-Umgebung auch hier initialisieren
+                  export NVM_DIR="$HOME/.nvm"
+                  [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
+                  
+                  # Version anzeigen und Status prüfen
+                  echo "Node.js version: $(node -v)"
+                  echo "PM2 version: $(pm2 -v)"
+                  
+                  # Status anzeigen
+                  pm2 status Kurz
+                EOF
+
+            - name: Deployment notification
+              if: always()
+              run: |
+                if [ ${{ job.status }} == "success" ]; then
+                  echo "Deployment erfolgreich abgeschlossen"
+                else
+                  echo "Deployment fehlgeschlagen"
+                fi
+    
