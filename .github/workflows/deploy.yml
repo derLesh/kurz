@@ -62,7 +62,6 @@ jobs:
                   --exclude="node_modules" \
                   --exclude=".git" \
                   --exclude=".github" \
-                  --exclude=".env*" \
                   ./ deployment-target:/home/Apps/Webapps/Kurz/
 
             - name: Detect Node.js and PM2 paths
